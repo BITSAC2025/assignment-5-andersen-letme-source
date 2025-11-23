@@ -1,8 +1,8 @@
 name: AutoGrader
 
 on:
-  push:
-    branches: [ "master" ]
+  schedule:
+    - cron: '0 16 * * 0'
   workflow_dispatch:
 
 env:
@@ -14,6 +14,8 @@ jobs:
   grade-assignment:
     runs-on: ubuntu-latest
     name: Compare with Reference Answer
+    permissions:
+      contents: write
 
     steps:
       # Checkout students' code
@@ -63,23 +65,22 @@ jobs:
       # Prepare test environment
       - name: Prepare Test Environment
         run: |
-          cp answer-repo/Assignment-2-IR/autogen.sh $ASSIGNMENT_DIR/Assignment-2-IR
-          cp answer-repo/Assignment-2-IR/normgraph.sh $ASSIGNMENT_DIR/Assignment-2-IR
-          cd $ASSIGNMENT_DIR/Assignment-2-IR
-          chmod +x autogen.sh normgraph.sh
+          cp answer-repo/Assignment-5-Andersen/autogen.sh $ASSIGNMENT_DIR/Assignment-5-Andersen
+          cd $ASSIGNMENT_DIR/Assignment-5-Andersen
+          chmod +x autogen.sh
 
       # Run student's code and capture output
       - name: Run Student's Code
         run: |
-          cd $ASSIGNMENT_DIR/Assignment-2-IR
+          cd $ASSIGNMENT_DIR/Assignment-5-Andersen
           ./autogen.sh
 
       # Compare answers
       - name: Compare Answers
         run: |
-          ANSWER_SOURCE_DIR="answer-repo/Assignment-2-IR/answers"
-          ANSWER_STUDENT_DIR="$ASSIGNMENT_DIR/Assignment-2-IR/answers"
-          RESULTS_DIR="$ASSIGNMENT_DIR/Assignment-2-IR/test-results"
+          ANSWER_SOURCE_DIR="answer-repo/Assignment-5-Andersen/answers"
+          ANSWER_STUDENT_DIR="$ASSIGNMENT_DIR/Assignment-5-Andersen/answers"
+          RESULTS_DIR="$ASSIGNMENT_DIR/Assignment-5-Andersen/test-results"
           mkdir -p $RESULTS_DIR
           
           correct_count=0
@@ -134,3 +135,23 @@ jobs:
           path: |
             $ASSIGNMENT_DIR/test-results/
           retention-days: 365
+
+      - name: Push Grading Summary to Student Repo
+        run: |
+          RESULTS_DIR="$ASSIGNMENT_DIR/Assignment-5-Andersen/test-results"
+          SUMMARY_FILE="grading_summary.txt"
+          
+          cp "$RESULTS_DIR/summary.txt" "$ASSIGNMENT_DIR/$SUMMARY_FILE"
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          git add "$SUMMARY_FILE"
+          
+          if ! git diff --cached --exit-code --quiet; then
+            git commit -m "AutoGrader: Add grading summary for assignment"
+            git push
+            echo "Successfully pushed $SUMMARY_FILE to the student repository."
+          else
+            echo "No changes in summary file detected. Skipping commit."
+          fi

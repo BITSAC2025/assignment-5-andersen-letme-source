@@ -3,191 +3,171 @@
  * @author kisslune
  */
 
-/**
- * Andersen.cpp
- * 基于包含约束(Andersen-style)的集合约束指针分析实现。
- * 约束：
- *   1) x = &a        : PT(x)  ⊇ {a}
- *   2) x = y         : PT(x)  ⊇ PT(y)
- *   3) *p = q        : ∀o∈PT(p):  PT(o) ⊇ PT(q)
- *   4) x = *p        : ∀o∈PT(p):  PT(x) ⊇ PT(o)
- *
- */
-
 #include "A5Header.h"
-#include <unordered_map>
-#include <unordered_set>
-#include <vector>
-#include <deque>
 
 using namespace llvm;
 using namespace std;
 
 int main(int argc, char** argv)
 {
-    auto moduleNameVec =
+    // Parse command-line options and build module set
+    auto moduleNames =
             OptionBase::parseOptions(argc, argv, "Whole Program Points-to Analysis",
                                      "[options] <input-bitcode...>");
 
-    SVF::LLVMModuleSet::buildSVFModule(moduleNameVec);
+    // Build the SVF module
+    SVF::LLVMModuleSet::buildSVFModule(moduleNames);
 
-    SVF::SVFIRBuilder builder;
-    auto pag = builder.build();
+    SVF::SVFIRBuilder irBuilder;
+    auto programAnalysisGraph = irBuilder.build();
+    auto constraintGraph = new SVF::ConstraintGraph(programAnalysisGraph);
+    constraintGraph->dump("ConstraintGraph");
 
-    // 构建约束图（本实现不直接依赖其 API；但课堂给了它的构建）
-    auto consg = new SVF::ConstraintGraph(pag);
+    Andersen pointerAnalysis(constraintGraph);
 
-    // consg->dump();
+    // Run pointer analysis
+    pointerAnalysis.runPointerAnalysis();
 
-    Andersen andersen(consg);
-    andersen.runPointerAnalysis();
-    andersen.dumpResult();
-
+    // Output the analysis result
+    pointerAnalysis.dumpResult();
     SVF::LLVMModuleSet::releaseLLVMModuleSet();
     return 0;
 }
 
-
 void Andersen::runPointerAnalysis()
 {
-    using NodeID = unsigned;
+    // Initialize a worklist for analysis
+    WorkList<unsigned> analysisWorklist;
 
-    // ----------------------------------------------------
-    // 1) 从 SVFIR(PAG) 收集基本约束边
-    // ----------------------------------------------------
-    SVF::SVFIR* pag = SVF::PAG::getPAG();
+    // Initial phase: Handle all address constraints (ptr = &obj)
+    // Address constraints indicate an object being directly assigned to a pointer
+    // Initialize points-to sets for pointers
+    for (auto nodeIter = consg->begin(); nodeIter != consg->end(); ++nodeIter)
+    {
+        unsigned nodeId = nodeIter->first;
+        SVF::ConstraintNode *currentNode = nodeIter->second;
 
-    struct SimpleEdge { NodeID src; NodeID dst; };
-    std::vector<SimpleEdge> addrEdges;   // x --Addr--> a           (x = &a)
-    std::vector<SimpleEdge> copyEdges;   // y --Copy--> x           (x = y)
-    std::vector<SimpleEdge> loadEdges;   // p --Load--> x           (x = *p)
-    std::vector<SimpleEdge> storeEdges;  // q --Store--> p          (*p = q)
+        // Iterate through all address incoming edges for this node and handle address constraints
+        const auto &addressEdges = currentNode->getAddrInEdges();
+        for (auto *edge : addressEdges)
+        {
+            SVF::AddrCGEdge *addressEdge = SVF::SVFUtil::dyn_cast<SVF::AddrCGEdge>(edge);
+            unsigned objectId = addressEdge->getSrcID();   // Source object
+            unsigned pointerId = addressEdge->getDstID();  // Target pointer
 
-    // 基本 Addr/Copy
-    for (SVF::PAGEdge *edge : pag->getSVFStmtSet(SVF::PAGEdge::Addr)) {
-        addrEdges.push_back({edge->getSrcID(), edge->getDstID()});
-    }
-    for (SVF::PAGEdge *edge : pag->getSVFStmtSet(SVF::PAGEdge::Copy)) {
-        copyEdges.push_back({edge->getSrcID(), edge->getDstID()});
-    }
-
-    // Phi, Select, Call, Ret, ThreadFork/Join 视为 Copy（流不敏感、全局分析）
-    for (SVF::PAGEdge *edge : pag->getSVFStmtSet(SVF::PAGEdge::Phi)) {
-        const SVF::PhiStmt *phi = SVF::SVFUtil::cast<SVF::PhiStmt>(edge);
-        for (const auto opVar : phi->getOpndVars()) {
-            copyEdges.push_back({opVar->getId(), phi->getResID()});
+            // Add the object to the points-to set of the pointer: object ∈ pts(pointer)
+            pts[pointerId].insert(objectId);
+            analysisWorklist.push(pointerId);
         }
     }
-    for (SVF::PAGEdge *edge : pag->getSVFStmtSet(SVF::PAGEdge::Select)) {
-        const SVF::SelectStmt *sel = SVF::SVFUtil::cast<SVF::SelectStmt>(edge);
-        for (const auto opVar : sel->getOpndVars()) {
-            copyEdges.push_back({opVar->getId(), sel->getResID()});
-        }
-    }
-    for (SVF::PAGEdge *edge : pag->getSVFStmtSet(SVF::PAGEdge::Call)) {
-        copyEdges.push_back({edge->getSrcID(), edge->getDstID()});
-    }
-    for (SVF::PAGEdge *edge : pag->getSVFStmtSet(SVF::PAGEdge::Ret)) {
-        copyEdges.push_back({edge->getSrcID(), edge->getDstID()});
-    }
-    for (SVF::PAGEdge *edge : pag->getSVFStmtSet(SVF::PAGEdge::ThreadFork)) {
-        copyEdges.push_back({edge->getSrcID(), edge->getDstID()});
-    }
-    for (SVF::PAGEdge *edge : pag->getSVFStmtSet(SVF::PAGEdge::ThreadJoin)) {
-        copyEdges.push_back({edge->getSrcID(), edge->getDstID()});
-    }
 
-    // Load / Store
-    for (SVF::PAGEdge *edge : pag->getSVFStmtSet(SVF::PAGEdge::Load)) {
-        loadEdges.push_back({edge->getSrcID(), edge->getDstID()});  // p -> x
-    }
-    for (SVF::PAGEdge *edge : pag->getSVFStmtSet(SVF::PAGEdge::Store)) {
-        storeEdges.push_back({edge->getSrcID(), edge->getDstID()}); // q -> p
-    }
+    // Main loop: Iterate over the constraints until the worklist is empty
+    while (!analysisWorklist.empty())
+    {
+        unsigned pointer = analysisWorklist.pop();
+        SVF::ConstraintNode *pointerNode = consg->getConstraintNode(pointer);
 
-    // ----------------------------------------------------
-    // 2) 构建辅助结构：复制后继、load/store 基指针映射
-    // ----------------------------------------------------
-    // pts[v] 已在类中定义：map<unsigned, set<unsigned>>
-    std::unordered_map<NodeID, std::vector<NodeID>> copySucc;      // v 的复制后继
-    std::unordered_map<NodeID, std::unordered_set<NodeID>> copySuccSet; // 去重
-    std::unordered_map<NodeID, std::vector<NodeID>> loadBase;      // p -> [x...] (x = *p)
-    std::unordered_map<NodeID, std::vector<NodeID>> storeBase;     // p -> [q...] (*p = q)
+        // Handle Store and Load constraints: For each object in the points-to set, add a Copy edge
+        for (unsigned object : pts[pointer])
+        {
+            // Handle Store constraints: *pointer = srcPointer
+            // For each srcPointer --Store--> pointer, add srcPointer --Copy--> object
+            const auto &storeInEdges = pointerNode->getStoreInEdges();
+            for (auto *edge : storeInEdges)
+            {
+                SVF::StoreCGEdge *storeEdge = SVF::SVFUtil::dyn_cast<SVF::StoreCGEdge>(edge);
+                unsigned sourcePointer = storeEdge->getSrcID();
 
-    for (const auto &e : copyEdges) {
-        copySucc[e.src].push_back(e.dst);
-        copySuccSet[e.src].insert(e.dst);
-    }
-    for (const auto &e : loadEdges) {
-        loadBase[e.src].push_back(e.dst);
-    }
-    for (const auto &e : storeEdges) {
-        storeBase[e.dst].push_back(e.src);   // 记录到 p：谁往 *p 里存
-    }
-
-    // 记录 (p,o) 已处理，避免针对同一 o∈PT(p) 反复生成间接复制边
-    std::unordered_map<NodeID, std::unordered_set<NodeID>> processedPO;
-
-    // ----------------------------------------------------
-    // 3) 工作队列固定点
-    // ----------------------------------------------------
-    std::deque<NodeID> wl;
-    std::unordered_set<NodeID> inWL;
-
-    auto enqueue = [&](NodeID n) {
-        if (!inWL.count(n)) { wl.push_back(n); inWL.insert(n); }
-    };
-
-    auto addPts = [&](NodeID v, NodeID o) -> bool {
-        std::set<NodeID> &S = pts[v];
-        if (S.insert(o).second) { enqueue(v); return true; }
-        return false;
-    };
-
-    // 初始化：Addr 约束
-    for (const auto &e : addrEdges) {
-        addPts(e.src, e.dst);  // PT(x) ⊇ {a}
-    }
-
-    // 主循环
-    while (!wl.empty()) {
-        NodeID v = wl.front(); wl.pop_front(); inWL.erase(v);
-
-        // (a) 复制传播：PT(succ) ⊇ PT(v)
-        auto itSucc = copySucc.find(v);
-        if (itSucc != copySucc.end()) {
-            for (NodeID w : itSucc->second) {
-                for (NodeID o : pts[v]) addPts(w, o);
-            }
-        }
-
-        // (b) 针对每个 o∈PT(v) 处理由 load/store 诱导的间接复制
-        for (NodeID o : pts[v]) {
-            if (processedPO[v].count(o)) continue;
-            processedPO[v].insert(o);
-
-            // Load：v --Load--> x  ⇒  o --Copy--> x  ⇒ PT(x) ⊇ PT(o)
-            auto itL = loadBase.find(v);
-            if (itL != loadBase.end()) {
-                for (NodeID x : itL->second) {
-                    if (!copySuccSet[o].count(x)) {
-                        copySucc[o].push_back(x);
-                        copySuccSet[o].insert(x);
+                // Check if the Copy edge (sourcePointer --Copy--> object) already exists
+                SVF::ConstraintNode *sourceNode = consg->getConstraintNode(sourcePointer);
+                bool hasCopyEdge = false;
+                for (auto *copyEdge : sourceNode->getCopyOutEdges())
+                {
+                    if (copyEdge->getDstID() == object)
+                    {
+                        hasCopyEdge = true;
+                        break;
                     }
-                    for (NodeID oo : pts[o]) addPts(x, oo);
+                }
+
+                // If the Copy edge doesn't exist, add it and push the source pointer to the worklist
+                if (!hasCopyEdge)
+                {
+                    consg->addCopyCGEdge(sourcePointer, object);
+                    analysisWorklist.push(sourcePointer);
                 }
             }
 
-            // Store：q --Store--> v  ⇒  q --Copy--> o  ⇒ PT(o) ⊇ PT(q)
-            auto itS = storeBase.find(v);
-            if (itS != storeBase.end()) {
-                for (NodeID qNode : itS->second) {
-                    if (!copySuccSet[qNode].count(o)) {
-                        copySucc[qNode].push_back(o);
-                        copySuccSet[qNode].insert(o);
+            // Handle Load constraints: dstPointer = *pointer
+            // For each pointer --Load--> dstPointer, add object --Copy--> dstPointer
+            const auto &loadOutEdges = pointerNode->getLoadOutEdges();
+            for (auto *edge : loadOutEdges)
+            {
+                SVF::LoadCGEdge *loadEdge = SVF::SVFUtil::dyn_cast<SVF::LoadCGEdge>(edge);
+                unsigned destinationPointer = loadEdge->getDstID();
+
+                // Check if the Copy edge (object --Copy--> dstPointer) already exists
+                SVF::ConstraintNode *destinationNode = consg->getConstraintNode(destinationPointer);
+                bool hasCopyEdge = false;
+                for (auto *copyEdge : destinationNode->getCopyInEdges())
+                {
+                    if (copyEdge->getSrcID() == object)
+                    {
+                        hasCopyEdge = true;
+                        break;
                     }
-                    for (NodeID qq : pts[qNode]) addPts(o, qq);
                 }
+
+                // If the Copy edge doesn't exist, add it and push the object to the worklist
+                if (!hasCopyEdge)
+                {
+                    consg->addCopyCGEdge(object, destinationPointer);
+                    analysisWorklist.push(object);
+                }
+            }
+        }
+
+        // Handle Copy constraints: target = pointer
+        // Propagate the points-to set of pointer to the target's points-to set
+        const auto &copyOutEdges = pointerNode->getCopyOutEdges();
+        for (auto *edge : copyOutEdges)
+        {
+            SVF::CopyCGEdge *copyEdge = SVF::SVFUtil::dyn_cast<SVF::CopyCGEdge>(edge);
+            unsigned target = copyEdge->getDstID();
+
+            // Record the previous size of the target's points-to set
+            size_t prevSize = pts[target].size();
+            // Merge the points-to set of pointer into the target's points-to set
+            pts[target].insert(pts[pointer].begin(), pts[pointer].end());
+
+            // If the points-to set has changed, push the target to the worklist
+            if (pts[target].size() > prevSize)
+            {
+                analysisWorklist.push(target);
+            }
+        }
+
+        // Handle Gep constraints: target = pointer.field
+        // Access the field of the pointer's points-to objects
+        const auto &gepOutEdges = pointerNode->getGepOutEdges();
+        for (auto *edge : gepOutEdges)
+        {
+            SVF::GepCGEdge *gepEdge = SVF::SVFUtil::dyn_cast<SVF::GepCGEdge>(edge);
+            unsigned target = gepEdge->getDstID();
+
+            // Record the previous size of the target's points-to set
+            size_t prevSize = pts[target].size();
+            // For each object in the pointer's points-to set, access the corresponding field object
+            for (unsigned object : pts[pointer])
+            {
+                unsigned fieldObject = consg->getGepObjVar(object, gepEdge);
+                pts[target].insert(fieldObject);
+            }
+
+            // If the points-to set has changed, push the target to the worklist
+            if (pts[target].size() > prevSize)
+            {
+                analysisWorklist.push(target);
             }
         }
     }
